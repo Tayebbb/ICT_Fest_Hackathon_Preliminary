@@ -1,99 +1,168 @@
 # CoWork API Bug Fix Report
 
-This report summarizes the details of the fixed bugs in the coworking space booking API, including validations, caching, transactions, and concurrency issues.
+This report summarizes the details of all identified and resolved bugs in the coworking space booking API, covering validations, database constraints, caching, transactions, security, and concurrency.
 
 ---
 
-### Bugs 1–11 (Route Scope and Notification Liveness)
-* **File(s) changed**: `app/routers/admin.py`, `app/services/export.py`, `app/services/notifications.py`
-* **What was broken**: 
-  - Administrative exports did not enforce proper organizational scoping when exporting all bookings.
-  - Notifications were prone to deadlocks or blocking behavior under sequential/concurrent calls.
-* **Why it violated the business rule**: 
-  - Rule #9 (Multi-tenancy): Users must only ever read or act on data belonging to their own organization.
-  - Rule #16 (Liveness): The service must respond to all endpoints at all times and not hang under concurrent stress.
-* **How it was fixed**: 
-  - Restructured export logic to scope every query strictly by `org_id` and correct parameters.
-  - Optimized locks in `app/services/notifications.py` to prevent circular dependencies or deadlock states.
-* **How it was verified**: Evaluated via integration tests checking organization isolation and load tests verifying notification delivery without blocking.
+### Bug 1: Booking Start Times Allowed Past Bookings
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Booking creation allowed a start time up to 5 minutes in the past.
+* **Why it violated the business rule**: Rule #2 states that the booking `start_time` must be strictly in the future at request time, with no grace window of any size.
+* **How it was fixed**: Enforced strict future start time checks: `start_time > now`.
+* **How it was verified**: Tested attempts to book slots in the past (even by a few seconds) and verified they were rejected with `400 INVALID_BOOKING_WINDOW`.
 
 ---
 
-### Bug 12: Refund Rounding and RefundLog Consistency
+### Bug 2: Zero and Negative Duration Bookings Accepted
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Bookings with zero or negative durations (e.g. `end_time <= start_time`) were successfully saved.
+* **Why it violated the business rule**: Rule #2 states that `end_time` must be strictly after `start_time` and duration must be a whole number of hours between 1 and 8.
+* **How it was fixed**: Added validation checks ensuring `end_time > start_time` and that duration meets the minimum of 1 hour and maximum of 8 hours.
+* **How it was verified**: Attempted to book slots with zero or negative durations, verifying they failed with `400 INVALID_BOOKING_WINDOW`.
+
+---
+
+### Bug 3: Back-to-Back Bookings Incorrectly Rejected
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Bookings starting exactly when another ended (or ending when another started) were flagged as conflicts.
+* **Why it violated the business rule**: Rule #3 states that back-to-back bookings (one ending exactly when the other starts) are explicitly allowed.
+* **How it was fixed**: Corrected the conflict query overlap check to use strictly less/greater comparisons: `existing.start_time < new.end_time AND new.start_time < existing.end_time`.
+* **How it was verified**: Verified that back-to-back bookings successfully committed without raising conflicts.
+
+---
+
+### Bug 4: Pagination and Ordering Failures
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Pagination calculations returned incorrect offset indices, ignored requested limits, and sorted items in the wrong order.
+* **Why it violated the business rule**: Rule #11 states that pagination must sort bookings by ascending `start_time` (ties by ascending `id`) and slice pages according to offsets: `[(page - 1) * limit, page * limit)`.
+* **How it was fixed**: Corrected the order_by clause and pagination slice parameters in the database query.
+* **How it was verified**: Evaluated pagination queries with varying page/limit bounds and verified sorting order.
+
+---
+
+### Bug 5: Booking Details Returned Incorrect Start Time
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: `GET /bookings/{id}` mapped and returned `created_at` in place of the actual booking `start_time`.
+* **Why it violated the business rule**: The API contract requires that the returned booking object fields correctly map to their database attributes, including the correct `start_time`.
+* **How it was fixed**: Corrected the mapping in the detail response serializer.
+* **How it was verified**: Verified that the response payload matched the database record start time.
+
+---
+
+### Bug 6: Incorrect Refund Cancellation Percentages
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Notice calculations mapped incorrect refund percentages, specifically miscategorizing notices under 24 hours and notices at exactly 48 hours.
+* **Why it violated the business rule**: Rule #6 states that refunds must yield 100% for notice >= 48h, 50% for 24h <= notice < 48h, and 0% for notice < 24h.
+* **How it was fixed**: Re-implemented cancellation notice window logic using strict inequality checking matching the three defined tiers.
+* **How it was verified**: Tested cancellations at boundary intervals (e.g. exactly 48h, 23h 59m, 47h 59m) and checked resulting percentages.
+
+---
+
+### Bug 7: Export Cross-Organization Leakage
+* **File(s) changed**: `app/services/export.py`, `app/routers/admin.py`
+* **What was broken**: Passing `include_all=true` to the admin export endpoint returned bookings from other organizations.
+* **Why it violated the business rule**: Rule #9 states that admins may only ever read or act on data belonging to their own organization.
+* **How it was fixed**: Filtered the query inside the helper method to strictly scope the bookings by the admin's `org_id` regardless of `include_all`.
+* **How it was verified**: Tested exports from tenant admins and verified they never contained records belonging to other tenants.
+
+---
+
+### Bug 8: Notification Processing Deadlock
+* **File(s) changed**: `app/services/notifications.py`
+* **What was broken**: Send and audit locks were acquired in opposite orders across operations, causing deadlocks.
+* **Why it violated the business rule**: Rule #16 states no combination of concurrent valid requests may hang the service.
+* **How it was fixed**: Standardized lock acquisition order across all notification routines.
+* **How it was verified**: Ran multiple notification requests simultaneously under concurrency and verified no deadlocks occurred.
+
+---
+
+### Bug 9: Concurrent Reference Code Duplication
+* **File(s) changed**: `app/services/reference.py`
+* **What was broken**: Concurrent booking requests could get assigned duplicate sequential reference codes.
+* **Why it violated the business rule**: Rule #7 states that every booking's `reference_code` must be unique.
+* **How it was fixed**: Synchronized reference-code generation under a global lock.
+* **How it was verified**: Dispatched simultaneous booking creation calls and verified all received distinct, sequential codes.
+
+---
+
+### Bug 10: Stale Admin Reports Due to Missing Cache Invalidation
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Creating a booking did not invalidate the admin usage report cache, causing reports to remain stale.
+* **Why it violated the business rule**: Rule #12 states that the usage report must reflect the current state immediately.
+* **How it was fixed**: Added `cache.invalidate_report(user.org_id)` to the booking creation flow.
+* **How it was verified**: Created a booking and confirmed the usage report reflected the changes immediately.
+
+---
+
+### Bug 11: Stale Availability Due to Missing Cache Invalidation
+* **File(s) changed**: `app/routers/bookings.py`
+* **What was broken**: Cancelling a booking did not invalidate the room availability cache, making cancelled slots appear occupied.
+* **Why it violated the business rule**: Rule #13 states availability must reflect current status immediately.
+* **How it was fixed**: Added `cache.invalidate_availability(...)` in the booking cancellation flow.
+* **How it was verified**: Cancelled a booking and verified the room availability slots updated immediately.
+
+---
+
+### Bug 12: Inconsistent Rounding Methods for Refunds
 * **File(s) changed**: `app/routers/bookings.py`, `app/services/refunds.py`
-* **What was broken**: 
-  - Refund calculations used float division which introduced floating-point rounding errors.
-  - The logged refund in `RefundLog` was re-derived from the refund percentage, resulting in drift between the returned refund amount and the stored log entry.
-* **Why it violated the business rule**: Rule #6 states that the refund amount must round to the nearest cent (half-cents rounding up), and the returned amount must exactly equal the amount stored in the `RefundLog`.
-* **How it was fixed**: 
-  - Transitioned the refund calculation in `bookings.py` to integer-based half-up rounding: `refund_amount_cents = (booking.price_cents * refund_percent + 50) // 100`.
-  - Changed `log_refund` to accept the exact calculated `amount_cents` and write it directly.
-* **How it was verified**: Tested with boundary amounts (e.g. 50% of 35 cents -> 18, 50% of 1001 cents -> 501) and asserted equality between the cancellation response and database log.
+* **What was broken**: Refunds used floating-point calculations causing discrepancies between the API response refund value and the committed database `RefundLog`.
+* **Why it violated the business rule**: Rule #6 states that refunds must round to the nearest cent, half-cents rounding up, and the amount returned must equal the stored database log entry.
+* **How it was fixed**: Updated calculation to integer-based half-up rounding: `(price_cents * percent + 50) // 100`. Stored the exact returned amount directly in `log_refund`.
+* **How it was verified**: Verified correctness against fractional cent amounts (e.g. 50% of 1001 cents -> 501).
 
 ---
 
-### Bug 14: Availability Cache Invalidation after Cancellation
-* **File(s) changed**: `app/routers/bookings.py`
-* **What was broken**: Cancelling a booking did not invalidate the availability cache for that room and date.
-* **Why it violated the business rule**: Rule #13 requires that availability queries (`GET /rooms/{id}/availability`) reflect the current booking state immediately. Stale cached entries made cancelled slots appear busy.
-* **How it was fixed**: Added a call to `cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())` inside the `cancel_booking` flow before committing.
-* **How it was verified**: Queried availability of a room, booked it, cancelled the booking, and verified the slot immediately returned to "free" in subsequent availability requests.
-
----
-
-### Bug 18: Concurrency Violations in Rate Limiting
+### Bug 13: Rate Limiting Concurrency Bypass
 * **File(s) changed**: `app/services/ratelimit.py`
-* **What was broken**: The rate limiting logic performed checking, trimming, pausing, and writing to the memory bucket without synchronization, allowing concurrent requests to bypass the limit.
-* **Why it violated the business rule**: Rule #5 states booking creation is limited to 20 requests per rolling 60 seconds per user, including rejected requests.
-* **How it was fixed**: Wrapped the rate limit read/trim/append/write sequence inside a module-level lock (`_bucket_lock = threading.Lock()`).
-* **How it was verified**: Sent 25 simultaneous requests from a single user; exactly 20 succeeded and 5 returned `429 RATE_LIMITED`.
+* **What was broken**: Multi-threaded requests could read and append to rate limit buckets simultaneously, bypassing the 20-request threshold.
+* **Why it violated the business rule**: Rule #5 requires strict rate-limiting (20 requests per rolling 60 seconds) under concurrency.
+* **How it was fixed**: Placed rate limiting validation and updates under a module-level lock.
+* **How it was verified**: Dispatched 25 concurrent requests; exactly 20 succeeded and 5 returned `429`.
 
 ---
 
-### Bug 19: Room Stats Concurrency Race
+### Bug 14: Room Stats Concurrency Race
 * **File(s) changed**: `app/services/stats.py`
-* **What was broken**: Incremental statistics updates (`record_create` and `record_cancel`) performed read-modify-write operations unsynchronized. The artificial sleep in `_aggregate_pause()` context-switched threads, causing lost updates under load.
-* **Why it violated the business rule**: Rule #14 requires that room stats count and revenue must always be consistent with the database bookings themselves. Lost updates caused stats to drift.
-* **How it was fixed**: Wrapped the update sequences inside `record_create` and `record_cancel` under a module-level lock (`_stats_lock = threading.Lock()`).
-* **How it was verified**: Executed simultaneous creations and cancellations, confirming final count and revenue matched actual bookings perfectly.
+* **What was broken**: Unsynchronized read-modify-write sequences in `record_create` and `record_cancel` caused updates to get lost under high concurrency, leading to statistic drift.
+* **Why it violated the business rule**: Rule #14 requires room stats to remain consistent with actual bookings.
+* **How it was fixed**: Synchronized room stats mutations under a thread-safety lock.
+* **How it was verified**: Stressed stats with concurrent operations and confirmed no lost updates occurred.
 
 ---
 
-### Bug 20: Booking Create and Cancel Concurrency Violations
+### Bug 15: Booking Create and Cancel Race Conditions
 * **File(s) changed**: `app/routers/bookings.py`
-* **What was broken**: 
-  - Overlapping booking checks and quota validations were run without synchronization, permitting double-bookings and quota bypasses.
-  - Cancellation requests on the same booking raced, committing multiple duplicate `RefundLog` entries.
-* **Why it violated the business rule**: Rules #3, #4, and #6 dictate strict enforcement of double-booking prevention, 3-booking rolling quota limit, and single `RefundLog` generation.
-* **How it was fixed**: Created a module-level lock (`_booking_lock = threading.Lock()`) and wrapped the critical sections of both `create_booking` and `cancel_booking` in it.
-* **How it was verified**: Tested with multi-threaded clients sending concurrent overlapping slots, concurrent quota-crossing bookings, and concurrent duplicate cancellation requests.
+* **What was broken**: Creation conflict checks, quota validations, and double-cancellation checks raced under concurrent requests, causing double-bookings, quota bypasses, and duplicate refunds.
+* **Why it violated the business rule**: Rules #3, #4, and #6 require strict concurrency correctness for slot conflicts, quota allocations, and cancellation idempotency.
+* **How it was fixed**: Wrapped booking creation and cancellation paths under a module-level lock (`_booking_lock`).
+* **How it was verified**: Simulated parallel overlapping requests and parallel cancellation requests, ensuring only one request succeeded.
 
 ---
 
-### Concurrent Refresh Token Rotation
-* **File(s) changed**: `app/routers/auth.py`
-* **What was broken**: Multiple concurrent token rotations (`POST /auth/refresh`) using the same refresh token could both query `is_token_revoked` as `False` before either completed `revoke_access_token`, creating duplicate active sessions.
-* **Why it violated the business rule**: Rule #8 dictates refresh tokens are single-use only, and reuse must trigger a `401`.
-* **How it was fixed**: Introduced `_refresh_lock = threading.Lock()` and wrapped the rotation verification and revocation sequence inside the lock.
-* **How it was verified**: Sent 5 concurrent refresh requests with the same token; exactly 1 succeeded and 4 returned `401`.
-
----
-
-### Concurrent Registration Race
-* **File(s) changed**: `app/routers/auth.py`
-* **What was broken**: Concurrent registration requests for the same new organization or username could bypass the validation checks and write to the database, causing one thread to crash with a `500 Internal Server Error` due to SQLite constraint violations.
-* **Why it violated the business rule**: Rule #15 requires duplicate registrations to return a clean `409 USERNAME_TAKEN` instead of crashing.
-* **How it was fixed**: Introduced `_register_lock = threading.Lock()` and wrapped the registration transaction path in it.
-* **How it was verified**: Dispatched 5 concurrent duplicate registrations; exactly 1 succeeded and 4 returned `409 USERNAME_TAKEN`.
-
----
-
-### Split-Transaction Cancellation
+### Bug 16: Split-Transaction Cancellation
 * **File(s) changed**: `app/services/refunds.py`
-* **What was broken**: `log_refund()` committed the `RefundLog` record before `cancel_booking` committed the status update to `"cancelled"`. A process crash or network drop in between would leave the booking `"confirmed"` while committing the `RefundLog`.
-* **Why it violated the business rule**: Rule #6 requires cancellation and refund logging to be consistent and atomic.
-* **How it was fixed**: Removed `db.commit()` and `db.refresh()` from `log_refund()` and replaced them with `db.flush()`. This keeps the database transaction active so the `RefundLog` and booking status update are committed atomically at the end of the handler.
-* **How it was verified**: Verified that the cancellation commits both states atomically, preventing database drift on intermediate failures.
+* **What was broken**: `log_refund()` committed the `RefundLog` before the booking status update was committed. A crash in between left the booking confirmed but logged as refunded.
+* **Why it violated the business rule**: Rule #6 states that a cancelled booking has exactly one RefundLog entry and both states must transition atomically.
+* **How it was fixed**: Replaced `db.commit()` and `db.refresh()` in `log_refund` with `db.flush()`, deferring the final commit to the end of the handler for atomic consistency.
+* **How it was verified**: Confirmed database state updates committed atomically.
+
+---
+
+### Bug 17: Concurrent Refresh Token Reuse
+* **File(s) changed**: `app/routers/auth.py`
+* **What was broken**: Concurrent token rotations using the same refresh token could both query `is_token_revoked` as `False` before either completed revocation, creating duplicate active sessions.
+* **Why it violated the business rule**: Rule #8 dictates refresh tokens are single-use only.
+* **How it was fixed**: Wrapped the validation and revocation sequence inside `_refresh_lock`.
+* **How it was verified**: Verified that concurrent reuse allowed exactly 1 success and 4 failures.
+
+---
+
+### Bug 18: Concurrent Registration Race
+* **File(s) changed**: `app/routers/auth.py`
+* **What was broken**: Concurrent registrations for the same new organization or username could bypass checks, causing database integrity constraint failures and returning `500 Internal Server Error`.
+* **Why it violated the business rule**: Rule #15 requires duplicate registrations to return `409 USERNAME_TAKEN` cleanly.
+* **How it was fixed**: Synchronized the registration path under `_register_lock`.
+* **How it was verified**: Verified that concurrent duplicate requests yield exactly one success and 409 responses.
 
 ---
 
